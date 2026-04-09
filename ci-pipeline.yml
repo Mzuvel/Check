@@ -1,0 +1,499 @@
+# ============================================================
+# AETHERIS OMNIVERSE — CI/CD Pipeline
+# Covers: lint, typecheck, unit tests, integration tests,
+#         security scanning, Docker build, multi-region deploy
+# ============================================================
+
+name: Aetheris CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop, "release/**"]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      deploy_env:
+        description: "Target environment"
+        required: true
+        default: staging
+        type: choice
+        options: [staging, production]
+
+env:
+  NODE_VERSION: "22"
+  PNPM_VERSION: "9"
+  REGISTRY:     "ghcr.io"
+  IMAGE_BASE:   "ghcr.io/${{ github.repository }}"
+  TURBO_TOKEN:  ${{ secrets.TURBO_TOKEN }}
+  TURBO_TEAM:   ${{ secrets.TURBO_TEAM }}
+
+# ──────────────────────────────────────────────────────────
+# STAGE 1: LINT + TYPECHECK (parallel, uses Turborepo cache)
+# ──────────────────────────────────────────────────────────
+jobs:
+  lint-typecheck:
+    name: "🔍 Lint & TypeCheck"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Turborepo lint + typecheck
+        run: pnpm turbo run lint typecheck --cache-dir=.turbo
+        env:
+          FORCE_COLOR: "1"
+
+      - name: Upload TypeScript diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsc-diagnostics
+          path: "**/tsc-error.log"
+
+# ──────────────────────────────────────────────────────────
+# STAGE 2: UNIT TESTS
+# ──────────────────────────────────────────────────────────
+  unit-tests:
+    name: "🧪 Unit Tests"
+    needs: lint-typecheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        package:
+          - packages/kernel
+          - packages/renderer
+          - packages/network
+          - packages/security
+          - packages/economy
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with: { version: "${{ env.PNPM_VERSION }}" }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Run Vitest with coverage
+        run: pnpm --filter "${{ matrix.package }}" test:coverage
+        env:
+          VITEST_MIN_COVERAGE: "80"
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.package == 'packages/kernel' && 'kernel' || matrix.package }}
+          path: "${{ matrix.package }}/coverage"
+
+      - name: Coverage gate check
+        run: |
+          COVERAGE=$(cat ${{ matrix.package }}/coverage/coverage-summary.json | jq '.total.lines.pct')
+          echo "Line coverage: ${COVERAGE}%"
+          if (( $(echo "$COVERAGE < 80" | bc -l) )); then
+            echo "::error::Coverage ${COVERAGE}% is below 80% threshold"
+            exit 1
+          fi
+
+# ──────────────────────────────────────────────────────────
+# STAGE 3: INTEGRATION TESTS (Docker Compose)
+# ──────────────────────────────────────────────────────────
+  integration-tests:
+    name: "🔗 Integration Tests"
+    needs: unit-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB:       aetheris_test
+          POSTGRES_USER:     aetheris
+          POSTGRES_PASSWORD: ${{ secrets.TEST_DB_PASSWORD }}
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports: ["5432:5432"]
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+        ports: ["6379:6379"]
+      mongodb:
+        image: mongo:7
+        ports: ["27017:27017"]
+      influxdb:
+        image: influxdb:2.7-alpine
+        env:
+          DOCKER_INFLUXDB_INIT_MODE:     setup
+          DOCKER_INFLUXDB_INIT_USERNAME: aetheris
+          DOCKER_INFLUXDB_INIT_PASSWORD: ${{ secrets.INFLUX_PASSWORD }}
+          DOCKER_INFLUXDB_INIT_ORG:      aetheris
+          DOCKER_INFLUXDB_INIT_BUCKET:   game_metrics
+        ports: ["8086:8086"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with: { version: "${{ env.PNPM_VERSION }}" }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Run database migrations
+        run: pnpm --filter "services/auth-service" db:migrate
+        env:
+          DATABASE_URL: postgresql://aetheris:${{ secrets.TEST_DB_PASSWORD }}@localhost:5432/aetheris_test
+
+      - name: Run integration tests
+        run: pnpm turbo run test:integration
+        env:
+          DATABASE_URL:  postgresql://aetheris:${{ secrets.TEST_DB_PASSWORD }}@localhost:5432/aetheris_test
+          REDIS_URL:     redis://localhost:6379
+          MONGODB_URL:   mongodb://localhost:27017/aetheris_test
+          INFLUX_URL:    http://localhost:8086
+          NODE_ENV:      test
+
+# ──────────────────────────────────────────────────────────
+# STAGE 4: SECURITY SCANNING
+# ──────────────────────────────────────────────────────────
+  security-scan:
+    name: "🔒 Security Scan"
+    needs: lint-typecheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      security-events: write
+      contents:        read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with: { version: "${{ env.PNPM_VERSION }}" }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # Snyk: dependency vulnerability scan
+      - name: Snyk dependency audit
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: "--severity-threshold=high --all-projects"
+        continue-on-error: true
+
+      # CodeQL: static analysis
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          queries: security-extended,security-and-quality
+
+      - name: Build for CodeQL
+        run: pnpm turbo run build --filter="packages/*"
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:javascript-typescript"
+
+      # npm audit hard fail on critical
+      - name: npm audit (critical only)
+        run: pnpm audit --audit-level=critical
+
+      # Secret scanning
+      - name: Gitleaks secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+# ──────────────────────────────────────────────────────────
+# STAGE 5: DOCKER BUILD & PUSH
+# ──────────────────────────────────────────────────────────
+  docker-build:
+    name: "🐳 Docker Build"
+    needs: [unit-tests, integration-tests, security-scan]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    if: github.event_name != 'pull_request'
+    strategy:
+      matrix:
+        service:
+          - gateway
+          - auth-service
+          - matchmaking-service
+          - game-state-service
+          - streaming-service
+          - anticheat-service
+          - economy-service
+          - analytics-service
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=moby/buildkit:latest
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_BASE }}/${{ matrix.service }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build & Push (multi-platform)
+        uses: docker/build-push-action@v6
+        with:
+          context:    services/${{ matrix.service }}
+          file:       services/${{ matrix.service }}/Dockerfile
+          platforms:  linux/amd64,linux/arm64
+          push:       true
+          tags:       ${{ steps.meta.outputs.tags }}
+          labels:     ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to:   type=gha,scope=${{ matrix.service }},mode=max
+          build-args: |
+            COMMIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+
+      # Trivy container scan
+      - name: Trivy container scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE_BASE }}/${{ matrix.service }}:sha-${{ github.sha }}"
+          format:    sarif
+          output:    trivy-${{ matrix.service }}.sarif
+          severity:  "CRITICAL,HIGH"
+          exit-code: "1"
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.service }}.sarif
+
+# ──────────────────────────────────────────────────────────
+# STAGE 6: DEPLOY TO STAGING
+# ──────────────────────────────────────────────────────────
+  deploy-staging:
+    name: "🚀 Deploy Staging"
+    needs: docker-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: staging
+      url:  https://staging.aetheris.gg
+    if: github.ref == 'refs/heads/develop' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (staging)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID_STAGING }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_STAGING }}
+          aws-region:            us-east-1
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.30.0
+
+      - name: Configure kubeconfig (staging EKS)
+        run: aws eks update-kubeconfig --name aetheris-staging --region us-east-1
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.15.0
+
+      - name: Helm upgrade (staging)
+        run: |
+          helm upgrade --install aetheris ./infra/helm/aetheris-stack \
+            --namespace aetheris-staging \
+            --create-namespace \
+            --values ./infra/helm/aetheris-stack/values.staging.yaml \
+            --set global.image.tag=sha-${{ github.sha }} \
+            --set global.environment=staging \
+            --wait \
+            --timeout 10m \
+            --atomic
+
+      - name: Run smoke tests
+        run: |
+          STAGING_URL=https://staging.aetheris.gg
+          curl -f "${STAGING_URL}/health" || exit 1
+          curl -f "${STAGING_URL}/api/v1/status" | jq '.status == "ok"' | grep true || exit 1
+          echo "Smoke tests passed ✅"
+
+      - name: Notify Slack (staging)
+        if: always()
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ secrets.SLACK_DEPLOY_CHANNEL }}
+          slack-token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '✅' || '❌' }} Staging deploy *${{ job.status }}* — sha `${{ github.sha }}`"
+            }
+
+# ──────────────────────────────────────────────────────────
+# STAGE 7: PRODUCTION CANARY (5% → 25% → 100%)
+# ──────────────────────────────────────────────────────────
+  deploy-prod-canary:
+    name: "🕯️ Prod Canary (5%)"
+    needs: deploy-staging
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: production
+      url:  https://play.aetheris.gg
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (prod)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID_PROD }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+          aws-region:            us-east-1
+
+      - name: Set up kubectl + helm
+        run: |
+          aws eks update-kubeconfig --name aetheris-prod-us-east-1 --region us-east-1
+
+      - name: Deploy canary (5% traffic)
+        run: |
+          helm upgrade --install aetheris-canary ./infra/helm/aetheris-stack \
+            --namespace aetheris-prod \
+            --values ./infra/helm/aetheris-stack/values.production.yaml \
+            --set global.image.tag=sha-${{ github.sha }} \
+            --set canary.enabled=true \
+            --set canary.weight=5 \
+            --wait --timeout 10m --atomic
+
+      - name: Monitor canary (5 min baseline)
+        run: |
+          sleep 300
+          # Check error rate in InfluxDB
+          ERROR_RATE=$(curl -s "${INFLUX_URL}/api/v2/query" \
+            -H "Authorization: Token ${{ secrets.INFLUX_TOKEN }}" \
+            -d 'from(bucket:"game_metrics") |> range(start:-5m) |> filter(fn:(r)=>r._measurement=="http_errors") |> mean()' \
+            | jq '.[0].value // 0')
+          echo "Canary error rate: $ERROR_RATE"
+          if (( $(echo "$ERROR_RATE > 0.01" | bc -l) )); then
+            echo "::error::Canary error rate ${ERROR_RATE} exceeds 1% threshold — rolling back"
+            helm rollback aetheris-canary --namespace aetheris-prod
+            exit 1
+          fi
+        env:
+          INFLUX_URL: ${{ secrets.INFLUX_URL }}
+
+  deploy-prod-full:
+    name: "🌍 Prod Full Rollout (Multi-region)"
+    needs: deploy-prod-canary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment:
+      name: production-full
+      url:  https://play.aetheris.gg
+    strategy:
+      max-parallel: 1  # sequential rollout
+      matrix:
+        region:
+          - { name: us-east-1, cluster: aetheris-prod-us-east-1 }
+          - { name: eu-west-1, cluster: aetheris-prod-eu-west-1 }
+          - { name: ap-southeast-1, cluster: aetheris-prod-ap-southeast-1 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS (${{ matrix.region.name }})
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID_PROD }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+          aws-region:            ${{ matrix.region.name }}
+
+      - run: aws eks update-kubeconfig --name ${{ matrix.region.cluster }} --region ${{ matrix.region.name }}
+
+      - name: Full deploy to ${{ matrix.region.name }}
+        run: |
+          helm upgrade --install aetheris ./infra/helm/aetheris-stack \
+            --namespace aetheris-prod \
+            --values ./infra/helm/aetheris-stack/values.production.yaml \
+            --set global.image.tag=sha-${{ github.sha }} \
+            --set global.region=${{ matrix.region.name }} \
+            --set canary.enabled=false \
+            --wait --timeout 15m --atomic
+
+      - name: Post-deploy health check (${{ matrix.region.name }})
+        run: |
+          HEALTH_URL="https://${{ matrix.region.name }}.internal.aetheris.gg/health"
+          for i in {1..5}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL")
+            [ "$STATUS" = "200" ] && echo "Region ${{ matrix.region.name }} healthy ✅" && exit 0
+            echo "Attempt $i failed (HTTP $STATUS), retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Region ${{ matrix.region.name }} health check failed"
+          exit 1
+
+      - name: Notify Slack
+        if: always()
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ secrets.SLACK_DEPLOY_CHANNEL }}
+          slack-token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '🌍 ✅' || '🌍 ❌' }} Production deploy *${{ job.status }}* — region `${{ matrix.region.name }}` — sha `${{ github.sha }}`"
+            }
